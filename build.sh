@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build and install "SAS Bulletin.app" into ~/Applications.
+# Build and install "SAS Sync.app" into ~/Applications.
 # The app bundles a renamed copy of terminal-notifier (Contents/Helpers) so pop-ups use the SAS Bulletin icon.
 set -euo pipefail
 cd "$(dirname "$0")"
-APP_NAME="SAS Bulletin"
+APP_NAME="SAS Sync"
 BUILD="build/$APP_NAME.app"
 DEST="$HOME/Applications/$APP_NAME.app"
 TN_SRC="$(dirname "$(readlink -f "$(command -v terminal-notifier)")")/../terminal-notifier.app"
@@ -14,7 +14,7 @@ rm -rf build && mkdir -p "$BUILD/Contents/MacOS" "$BUILD/Contents/Resources" "$B
 echo "› Compiling"
 swiftc -O -parse-as-library -target arm64-apple-macos14.0 \
   -framework SwiftUI -framework WebKit -framework AppKit \
-  Sources/main.swift -o "$BUILD/Contents/MacOS/SASBulletin"
+  Sources/main.swift -o "$BUILD/Contents/MacOS/SASSync"
 
 echo "› Icon"
 [ -f Resources/AppIcon.icns ] || python3 Resources/make_icon.py
@@ -26,8 +26,8 @@ cat > "$BUILD/Contents/Info.plist" <<EOF
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
-  <key>CFBundleIdentifier</key><string>com.ianxie.sasbulletin.app</string>
-  <key>CFBundleExecutable</key><string>SASBulletin</string>
+  <key>CFBundleIdentifier</key><string>com.ianxie.sassync</string>
+  <key>CFBundleExecutable</key><string>SASSync</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -42,6 +42,7 @@ echo "› Notifier helper"
 H="$BUILD/Contents/Helpers/$APP_NAME Notifier.app"
 cp -R "$TN_SRC" "$H"; chmod -R u+w "$H"
 cp Resources/AppIcon.icns "$H/Contents/Resources/Terminal.icns"
+# keep the original notifier bundle id so macOS notification permission carries over
 plutil -replace CFBundleIdentifier -string com.ianxie.sasbulletin "$H/Contents/Info.plist"
 plutil -replace CFBundleName -string "$APP_NAME" "$H/Contents/Info.plist"
 plutil -replace CFBundleDisplayName -string "$APP_NAME" "$H/Contents/Info.plist" 2>/dev/null \
@@ -55,8 +56,8 @@ codesign --force --sign - "$BUILD"
 
 echo "› Installing to $DEST"
 mkdir -p "$HOME/Applications"
-pkill -x SASBulletin 2>/dev/null || true
-rm -rf "$DEST"
+pkill -x SASBulletin 2>/dev/null || true; pkill -x SASSync 2>/dev/null || true
+rm -rf "$DEST" "$HOME/Applications/SAS Bulletin.app"
 cp -R "$BUILD" "$DEST"
 LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 "$LSREG" -f "$DEST" "$DEST/Contents/Helpers/$APP_NAME Notifier.app"

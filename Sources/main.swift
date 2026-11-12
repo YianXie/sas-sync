@@ -1,6 +1,8 @@
-// SAS Bulletin — a small native macOS app for Ian's HS Daily Bulletin summaries.
-// The heavy lifting (Gmail, summarizing, scheduling) lives in ~/.hermes/scripts/sas_bulletin.py
-// and the Hermes cron job; this app is the control panel.
+// SAS Sync — a small native macOS app for Ian's Singapore American School workflow:
+//   • HS Daily Bulletin → short personalized summaries
+//   • Toddle assignments → Google Tasks "School" list
+// The heavy lifting lives in ~/.hermes/scripts (sas_bulletin.py, sas_tasks.py, sas_google.py)
+// and Hermes cron jobs; this app is the control panel.
 
 import AppKit
 import SwiftUI
@@ -11,7 +13,8 @@ import WebKit
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
     static let hermes = home.appendingPathComponent(".hermes")
-    static let cli = hermes.appendingPathComponent("scripts/sas_bulletin_cli.sh").path
+    static let bulletinCLI = hermes.appendingPathComponent("scripts/sas_bulletin_cli.sh").path
+    static let tasksCLI = hermes.appendingPathComponent("scripts/sas_tasks_cli.sh").path
     static let outDir = hermes.appendingPathComponent("sas_bulletins")
     static let config = outDir.appendingPathComponent("config.json")
     static let profile = outDir.appendingPathComponent("profile.md")
@@ -28,10 +31,7 @@ struct Bulletin: Codable, Identifiable, Hashable {
     let has_page: Bool
     let page: String
 
-    var date: Date? {
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX")
-        return f.date(from: stamp)
-    }
+    var date: Date? { Fmt.ymd.date(from: stamp) }
     var title: String {
         guard let d = date else { return subject }
         let f = DateFormatter(); f.dateFormat = "EEE, MMM d"
@@ -39,21 +39,57 @@ struct Bulletin: Codable, Identifiable, Hashable {
     }
 }
 
+struct SchoolTask: Codable, Identifiable, Hashable {
+    let id: String
+    let list: String
+    let title: String
+    let due: String
+    let when: String
+    let course: String
+    let link: String
+    let notes: String
+    let completed: Bool
+    let toddle: Bool
+
+    var dueDate: Date? { due.isEmpty ? nil : Fmt.ymd.date(from: due) }
+}
+
 struct LastPublish: Codable, Equatable { let stamp: String?; let title: String?; let time: Double? }
+
+struct JobInfo: Codable {
+    var found: Bool = false
+    var enabled: Bool = false
+    var next_run: String?
+    var last_run: String?
+    var last_status: String?
+}
 
 struct StatusInfo: Codable {
     var signed_in: Bool = false
     var offline: Bool = false
     var email: String?
     var error: String?
-    var job_found: Bool = false
-    var job_enabled: Bool = false
-    var next_run: String?
-    var last_run: String?
-    var last_status: String?
     var regen_pending: Bool = false
     var regen_id: String?
     var last_publish: LastPublish?
+    var jobs: [String: JobInfo]?
+
+    func job(_ k: String) -> JobInfo { jobs?[k] ?? JobInfo() }
+}
+
+struct SyncInfo: Codable {
+    let time: Double?
+    let ok: Bool?
+    let added: [[String]]?
+    let updated: [[String]]?
+    let error: String?
+}
+
+struct TasksStatus: Codable {
+    var signed_in: Bool = false
+    var offline: Bool = false
+    var error: String?
+    var last_sync: SyncInfo?
 }
 
 struct Config: Codable, Equatable {
@@ -67,37 +103,60 @@ struct Config: Codable, Equatable {
     var notifications = true
     var post_to_chat = true
     var extra_instructions = ""
+    var tasks_notifications = true
+    var tasks_lookahead_days = 28
 
     init() {}
     // Tolerant decoding: missing keys fall back to defaults.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let d = Config.defaults
-        for_you = (try? c.decode(Bool.self, forKey: .for_you)) ?? d.for_you
-        for_you_max = (try? c.decode(Int.self, forKey: .for_you_max)) ?? d.for_you_max
-        deadline_window_days = (try? c.decode(Int.self, forKey: .deadline_window_days)) ?? d.deadline_window_days
-        star_deadlines_only_if_relevant = (try? c.decode(Bool.self, forKey: .star_deadlines_only_if_relevant)) ?? d.star_deadlines_only_if_relevant
-        college_list_only = (try? c.decode(Bool.self, forKey: .college_list_only)) ?? d.college_list_only
-        also_new = (try? c.decode(Bool.self, forKey: .also_new)) ?? d.also_new
-        everything_else = (try? c.decode(Bool.self, forKey: .everything_else)) ?? d.everything_else
-        notifications = (try? c.decode(Bool.self, forKey: .notifications)) ?? d.notifications
-        post_to_chat = (try? c.decode(Bool.self, forKey: .post_to_chat)) ?? d.post_to_chat
-        extra_instructions = (try? c.decode(String.self, forKey: .extra_instructions)) ?? d.extra_instructions
+        let d = Config()
+        func v<T: Decodable>(_ k: CodingKeys, _ def: T) -> T { (try? c.decode(T.self, forKey: k)) ?? def }
+        for_you = v(.for_you, d.for_you)
+        for_you_max = v(.for_you_max, d.for_you_max)
+        deadline_window_days = v(.deadline_window_days, d.deadline_window_days)
+        star_deadlines_only_if_relevant = v(.star_deadlines_only_if_relevant, d.star_deadlines_only_if_relevant)
+        college_list_only = v(.college_list_only, d.college_list_only)
+        also_new = v(.also_new, d.also_new)
+        everything_else = v(.everything_else, d.everything_else)
+        notifications = v(.notifications, d.notifications)
+        post_to_chat = v(.post_to_chat, d.post_to_chat)
+        extra_instructions = v(.extra_instructions, d.extra_instructions)
+        tasks_notifications = v(.tasks_notifications, d.tasks_notifications)
+        tasks_lookahead_days = v(.tasks_lookahead_days, d.tasks_lookahead_days)
     }
-    static let defaults = Config()
 }
 
-// MARK: - Backend (runs the Python CLI)
+enum Fmt {
+    static let ymd: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
+    static func relative(_ ts: Double?) -> String {
+        guard let ts else { return "never" }
+        let r = RelativeDateTimeFormatter(); r.unitsStyle = .full
+        return r.localizedString(for: Date(timeIntervalSince1970: ts), relativeTo: Date())
+    }
+    static func iso(_ s: String) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let d = f.date(from: s) ?? { f.formatOptions = [.withInternetDateTime]; return f.date(from: s) }()
+        guard let d else { return s }
+        let o = DateFormatter(); o.dateFormat = "EEE MMM d, h:mm a"
+        return o.string(from: d)
+    }
+}
+
+// MARK: - Backend (runs the Python CLIs)
 
 enum Backend {
     struct Result { let code: Int32; let out: String; let err: String }
 
-    static func run(_ args: [String]) async -> Result {
+    static func run(_ cli: String, _ args: [String]) async -> Result {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/bin/bash")
-                p.arguments = [Paths.cli] + args
+                p.arguments = [cli] + args
                 var env = ProcessInfo.processInfo.environment
                 env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
                 p.environment = env
@@ -120,8 +179,8 @@ enum Backend {
         }
     }
 
-    static func json<T: Decodable>(_ type: T.Type, _ args: [String]) async -> (T?, String) {
-        let r = await run(args)
+    static func json<T: Decodable>(_ type: T.Type, _ cli: String, _ args: [String]) async -> (T?, String) {
+        let r = await run(cli, args)
         let line = r.out.split(separator: "\n").last.map(String.init) ?? ""
         if let data = line.data(using: .utf8), let v = try? JSONDecoder().decode(T.self, from: data) {
             return (v, "")
@@ -131,18 +190,26 @@ enum Backend {
     }
 }
 
+struct OKResult: Codable { let ok: Bool; let output: String? }
+
 // MARK: - App state
 
 @MainActor
 final class AppModel: ObservableObject {
+    static let assignmentsTag = "__assignments__"
+
     @Published var bulletins: [Bulletin] = []
+    @Published var tasks: [SchoolTask] = []
     @Published var status = StatusInfo()
+    @Published var tasksStatus = TasksStatus()
     @Published var config = Config()
-    @Published var selection: Bulletin.ID?
+    @Published var selection: String? = AppModel.assignmentsTag
     @Published var loading = false
     @Published var regenerating: String?          // bulletin id
+    @Published var syncing = false
+    @Published var completing: Set<String> = []
     @Published var banner: String?
-    @Published var pageVersion = 0                // bump to reload the web view
+    @Published var pageVersion = 0
     @Published var showSignIn = false
 
     private var saveTask: Task<Void, Never>?
@@ -152,29 +219,30 @@ final class AppModel: ObservableObject {
         Task { await refresh() }
     }
 
-    var selected: Bulletin? { bulletins.first { $0.id == selection } }
+    var selectedBulletin: Bulletin? { bulletins.first { $0.id == selection } }
 
     func refresh() async {
         loading = true
-        async let s = Backend.json(StatusInfo.self, ["status"])
-        async let l = Backend.json([Bulletin].self, ["list"])
+        async let s = Backend.json(StatusInfo.self, Paths.bulletinCLI, ["status"])
+        async let ts = Backend.json(TasksStatus.self, Paths.tasksCLI, ["json-status"])
         let (st, stErr) = await s
-        let (list, listErr) = await l
         if let st { status = st } else { banner = "Status error: \(stErr)" }
-        if let list {
-            bulletins = list
-            if selection == nil || !list.contains(where: { $0.id == selection }) {
-                selection = list.first(where: { $0.has_page })?.id ?? list.first?.id
-            }
-        } else if status.signed_in {
-            banner = "Couldn't load bulletins: \(listErr)"
+        if let t = (await ts).0 { tasksStatus = t }
+        if status.signed_in {
+            async let l = Backend.json([Bulletin].self, Paths.bulletinCLI, ["list"])
+            async let t = Backend.json([SchoolTask].self, Paths.tasksCLI, ["json-list"])
+            let (list, listErr) = await l
+            let (tl, tErr) = await t
+            if let list { bulletins = list } else { banner = "Couldn't load bulletins: \(listErr)" }
+            if let tl { tasks = tl } else { banner = "Couldn't load assignments: \(tErr)" }
+        } else if !status.offline {
+            showSignIn = true
         }
-        if !status.signed_in && !status.offline { showSignIn = true }
         loading = false
         pageVersion += 1
     }
 
-    // Config
+    // MARK: Config
     func loadConfig() {
         if let data = try? Data(contentsOf: Paths.config),
            let c = try? JSONDecoder().decode(Config.self, from: data) { config = c }
@@ -186,27 +254,32 @@ final class AppModel: ObservableObject {
         saveTask = Task {
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard !Task.isCancelled else { return }
-            let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            // Merge into the existing file so keys written by the scripts are preserved.
+            var dict = (try? JSONSerialization.jsonObject(with: Data(contentsOf: Paths.config))) as? [String: Any] ?? [:]
+            if let data = try? JSONEncoder().encode(snapshot),
+               let mine = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                dict.merge(mine) { _, new in new }
+            }
             try? FileManager.default.createDirectory(at: Paths.outDir, withIntermediateDirectories: true)
-            if let data = try? enc.encode(snapshot) { try? data.write(to: Paths.config, options: .atomic) }
+            if let out = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
+                try? out.write(to: Paths.config, options: .atomic)
+            }
         }
     }
 
-    // Regenerate
+    // MARK: Bulletins
     func regenerate(_ b: Bulletin) async {
         guard regenerating == nil else { return }
         regenerating = b.id
         banner = nil
         let started = Date().timeIntervalSince1970
-        let (res, err) = await Backend.json([String: AnyCodable].self, ["regen", b.id])
-        guard let res, (res["ok"]?.value as? Bool) == true else {
-            banner = "Couldn't start regeneration: \(err)"; regenerating = nil; return
+        let (res, err) = await Backend.json(OKResult.self, Paths.bulletinCLI, ["regen", b.id])
+        guard let res, res.ok else {
+            banner = "Couldn't start regeneration: \(res?.output ?? err)"; regenerating = nil; return
         }
-        // Poll until the job publishes a page newer than our request (max ~8 min).
-        for _ in 0..<96 {
+        for _ in 0..<96 {   // poll up to ~8 min
             try? await Task.sleep(nanoseconds: 5_000_000_000)
-            let (st, _) = await Backend.json(StatusInfo.self, ["status"])
-            if let st {
+            if let st = (await Backend.json(StatusInfo.self, Paths.bulletinCLI, ["status"])).0 {
                 status = st
                 if !st.regen_pending, let t = st.last_publish?.time, t > started {
                     regenerating = nil
@@ -218,20 +291,51 @@ final class AppModel: ObservableObject {
             }
         }
         regenerating = nil
-        banner = "Regeneration is taking longer than expected — it will still appear when Hermes finishes."
+        banner = "Regeneration is taking longer than expected — it will appear when Hermes finishes."
     }
 
-    func setSchedule(_ on: Bool) async {
-        let (res, err) = await Backend.json([String: AnyCodable].self, ["schedule", on ? "on" : "off"])
-        if res == nil { banner = "Couldn't change schedule: \(err)" }
+    // MARK: Assignments
+    func syncNow() async {
+        guard !syncing else { return }
+        syncing = true
+        let r = await Backend.run(Paths.tasksCLI, ["sync"])
+        syncing = false
+        let lines = r.out.split(separator: "\n").map(String.init)
+        if r.code != 0 {
+            banner = "Sync failed: " + (lines.last ?? r.err.split(separator: "\n").last.map(String.init) ?? "unknown error")
+        } else {
+            let added = lines.filter { $0.hasPrefix("ADDED") }.count
+            let moved = lines.filter { $0.hasPrefix("DUE->") }.count
+            banner = (added + moved == 0) ? "Assignments are up to date."
+                : "Sync done: \(added) added, \(moved) due date\(moved == 1 ? "" : "s") changed."
+        }
         await refresh()
     }
 
-    // Sign-in
+    func complete(_ t: SchoolTask) async {
+        completing.insert(t.id)
+        let (res, err) = await Backend.json(OKResult.self, Paths.tasksCLI, ["complete", t.id])
+        completing.remove(t.id)
+        if res?.ok == true {
+            withAnimation { tasks.removeAll { $0.id == t.id } }
+            banner = "Completed “\(t.title)”."
+        } else {
+            banner = "Couldn't complete task: \(err)"
+        }
+    }
+
+    // MARK: Schedules
+    func setSchedule(_ on: Bool, _ which: String) async {
+        let (res, err) = await Backend.json(OKResult.self, Paths.bulletinCLI, ["schedule", on ? "on" : "off", which])
+        if res?.ok != true { banner = "Couldn't change schedule: \(res?.output ?? err)" }
+        if let st = (await Backend.json(StatusInfo.self, Paths.bulletinCLI, ["status"])).0 { status = st }
+    }
+
+    // MARK: Sign-in (one Google sign-in shared by both features)
     func startSignIn() async -> Bool {
-        let r = await Backend.run(["auth-url"])
-        guard let line = r.out.split(separator: "\n").last, let url = URL(string: String(line)),
-              line.hasPrefix("https://") else {
+        let r = await Backend.run(Paths.bulletinCLI, ["auth-url"])
+        guard let line = r.out.split(separator: "\n").last, line.hasPrefix("https://"),
+              let url = URL(string: String(line)) else {
             banner = "Couldn't create sign-in link: \(r.err)"; return false
         }
         NSWorkspace.shared.open(url)
@@ -239,7 +343,7 @@ final class AppModel: ObservableObject {
     }
 
     func finishSignIn(_ pasted: String) async -> String? {
-        let r = await Backend.run(["auth-code", pasted.trimmingCharacters(in: .whitespacesAndNewlines)])
+        let r = await Backend.run(Paths.bulletinCLI, ["auth-code", pasted.trimmingCharacters(in: .whitespacesAndNewlines)])
         if r.out.contains("OK: token saved") {
             showSignIn = false
             banner = "Signed in."
@@ -248,20 +352,6 @@ final class AppModel: ObservableObject {
         }
         return (r.err + r.out).split(separator: "\n").suffix(2).joined(separator: " ")
     }
-}
-
-/// Minimal Any wrapper for decoding small JSON objects.
-struct AnyCodable: Codable {
-    let value: Any
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if let b = try? c.decode(Bool.self) { value = b }
-        else if let i = try? c.decode(Int.self) { value = i }
-        else if let d = try? c.decode(Double.self) { value = d }
-        else if let s = try? c.decode(String.self) { value = s }
-        else { value = NSNull() }
-    }
-    func encode(to encoder: Encoder) throws {}
 }
 
 // MARK: - Web view for summaries
@@ -289,7 +379,6 @@ struct SummaryWebView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var loadedKey = ""
-        // Links open in the default browser.
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             if action.navigationType == .linkActivated, let url = action.request.url, url.scheme != "file" {
@@ -307,17 +396,21 @@ struct SummaryWebView: NSViewRepresentable {
     }
 }
 
-// MARK: - Views
+// MARK: - Main window
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
         NavigationSplitView {
-            BulletinList()
+            Sidebar()
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 340)
         } detail: {
-            DetailView()
+            if model.selection == AppModel.assignmentsTag {
+                AssignmentsView()
+            } else {
+                BulletinDetail()
+            }
         }
         .toolbar {
             ToolbarItem(placement: .navigation) { StatusPill() }
@@ -325,9 +418,9 @@ struct ContentView: View {
                 if model.loading { ProgressView().controlSize(.small) }
                 Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .keyboardShortcut("r")
-                    .help("Refresh bulletin list")
+                    .help("Refresh")
                 SettingsLink { Label("Settings", systemImage: "gearshape") }
-                    .help("Summary settings (⌘,)")
+                    .help("Settings (⌘,)")
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -341,7 +434,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $model.showSignIn) { SignInSheet().environmentObject(model) }
-        .frame(minWidth: 860, minHeight: 560)
+        .frame(minWidth: 880, minHeight: 580)
     }
 }
 
@@ -357,16 +450,36 @@ struct StatusPill: View {
         }
         .font(.callout).foregroundStyle(.secondary)
         .lineLimit(1)
-        .fixedSize()                 // let the toolbar measure the full email width
+        .fixedSize()
         .padding(.horizontal, 10)
     }
 }
 
-struct BulletinList: View {
+struct Sidebar: View {
     @EnvironmentObject var model: AppModel
+
+    var overdueCount: Int {
+        let today = Fmt.ymd.string(from: Date())
+        return model.tasks.filter { !$0.due.isEmpty && $0.due < today }.count
+    }
+
     var body: some View {
         List(selection: $model.selection) {
-            Section("Bulletins") {
+            Section("Toddle") {
+                HStack {
+                    Label("Assignments", systemImage: "checklist")
+                    Spacer()
+                    if model.syncing { ProgressView().controlSize(.small) }
+                    else if overdueCount > 0 {
+                        Text("\(overdueCount)").font(.caption.bold()).padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Capsule().fill(.red)).foregroundStyle(.white)
+                    } else if !model.tasks.isEmpty {
+                        Text("\(model.tasks.count)").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .tag(AppModel.assignmentsTag)
+            }
+            Section("HS Daily Bulletin") {
                 ForEach(model.bulletins) { b in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -386,19 +499,152 @@ struct BulletinList: View {
                 }
             }
         }
-        .overlay {
-            if model.bulletins.isEmpty && !model.loading {
-                ContentUnavailableView("No bulletins", systemImage: "tray",
-                                       description: Text(model.status.signed_in ? "Nothing in the last 60 days." : "Sign in to load bulletins."))
+    }
+}
+
+// MARK: Assignments
+
+struct AssignmentsView: View {
+    @EnvironmentObject var model: AppModel
+
+    struct Group: Identifiable { let id: String; let title: String; let color: Color; let items: [SchoolTask] }
+
+    var groups: [Group] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        func days(_ t: SchoolTask) -> Int? {
+            guard let d = t.dueDate else { return nil }
+            return cal.dateComponents([.day], from: today, to: cal.startOfDay(for: d)).day
+        }
+        var buckets: [String: [SchoolTask]] = [:]
+        for t in model.tasks {
+            let k: String
+            switch days(t) {
+            case nil: k = "none"
+            case let n? where n < 0: k = "overdue"
+            case 0: k = "today"
+            case 1: k = "tomorrow"
+            case let n? where n <= 7: k = "week"
+            default: k = "later"
+            }
+            buckets[k, default: []].append(t)
+        }
+        let order: [(String, String, Color)] = [("overdue", "Overdue", .red), ("today", "Today", .orange),
+                                                ("tomorrow", "Tomorrow", .yellow), ("week", "Next 7 days", .blue),
+                                                ("later", "Later", .secondary), ("none", "No due date", .secondary)]
+        return order.compactMap { k, title, c in buckets[k].map { Group(id: k, title: title, color: c, items: $0) } }
+    }
+
+    var syncLine: String {
+        guard let s = model.tasksStatus.last_sync else { return "Not synced yet from this app" }
+        if s.ok == false { return "Last sync failed \(Fmt.relative(s.time)) — \(s.error ?? "")" }
+        let a = s.added?.count ?? 0, u = s.updated?.count ?? 0
+        return "Synced \(Fmt.relative(s.time))" + (a + u > 0 ? " · \(a) added, \(u) updated" : "")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("School assignments").font(.title3.bold())
+                    Text(syncLine).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { Task { await model.syncNow() } } label: {
+                    Label(model.syncing ? "Syncing…" : "Sync Now", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(model.syncing || !model.status.signed_in)
+                .help("Pull new assignments from Toddle into Google Tasks")
+                Button { NSWorkspace.shared.open(URL(string: "https://tasks.google.com/")!) } label: {
+                    Image(systemName: "arrow.up.forward.app")
+                }.help("Open Google Tasks")
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            Divider()
+            if model.tasks.isEmpty {
+                ContentUnavailableView {
+                    Label(model.status.signed_in ? "All caught up" : "Not signed in",
+                          systemImage: model.status.signed_in ? "checkmark.seal" : "person.crop.circle.badge.exclamationmark")
+                } description: {
+                    Text(model.status.signed_in ? "No open tasks in your Google Tasks “School” list."
+                                                : "Sign in to sync Toddle assignments.")
+                }
+            } else {
+                List {
+                    ForEach(groups) { g in
+                        Section {
+                            ForEach(g.items) { t in TaskRow(task: t) }
+                        } header: {
+                            HStack(spacing: 6) {
+                                Circle().fill(g.color).frame(width: 7, height: 7)
+                                Text(g.title)
+                                Text("\(g.items.count)").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.inset)
             }
         }
     }
 }
 
-struct DetailView: View {
+struct TaskRow: View {
+    @EnvironmentObject var model: AppModel
+    let task: SchoolTask
+
+    var subtitle: String {
+        var parts: [String] = []
+        if !task.course.isEmpty { parts.append(task.course) }
+        if !task.when.isEmpty { parts.append(task.when) }
+        else if let d = task.dueDate {
+            let f = DateFormatter(); f.dateFormat = "EEE MMM d"; parts.append(f.string(from: d))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if model.completing.contains(task.id) {
+                ProgressView().controlSize(.small).frame(width: 18)
+            } else {
+                Button { Task { await model.complete(task) } } label: {
+                    Image(systemName: "circle").font(.system(size: 16)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Mark as done (completes it in Google Tasks)")
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.title).lineLimit(2)
+                if !subtitle.isEmpty {
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer()
+            if let url = URL(string: task.link), !task.link.isEmpty {
+                Button { NSWorkspace.shared.open(url) } label: { Image(systemName: "link") }
+                    .buttonStyle(.borderless)
+                    .help(task.link.contains("toddle") ? "Open in Toddle" : "Open source email")
+            }
+        }
+        .padding(.vertical, 3)
+        .contextMenu {
+            Button("Mark as Done") { Task { await model.complete(task) } }
+            if !task.notes.isEmpty {
+                Button("Copy Notes") {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(task.notes, forType: .string)
+                }
+            }
+        }
+    }
+}
+
+// MARK: Bulletin detail
+
+struct BulletinDetail: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        if let b = model.selected {
+        if let b = model.selectedBulletin {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading) {
@@ -408,9 +654,7 @@ struct DetailView: View {
                         }
                     }
                     Spacer()
-                    Button {
-                        Task { await model.regenerate(b) }
-                    } label: {
+                    Button { Task { await model.regenerate(b) } } label: {
                         Label(b.has_page ? "Regenerate" : "Generate Summary", systemImage: "sparkles")
                     }
                     .disabled(model.regenerating != nil || !model.status.signed_in)
@@ -439,10 +683,28 @@ struct DetailView: View {
     }
 }
 
+// MARK: - Settings
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
 
+    func scheduleBinding(_ which: String) -> Binding<Bool> {
+        Binding(get: { model.status.job(which).enabled },
+                set: { on in Task { await model.setSchedule(on, which) } })
+    }
+
     var body: some View {
+        TabView {
+            bulletinTab.tabItem { Label("Bulletin", systemImage: "newspaper") }
+            assignmentsTab.tabItem { Label("Assignments", systemImage: "checklist") }
+            accountTab.tabItem { Label("Account", systemImage: "person.crop.circle") }
+        }
+        .frame(width: 540)
+        .onChange(of: model.config) { _, _ in model.scheduleSave() }
+        .sheet(isPresented: $model.showSignIn) { SignInSheet().environmentObject(model) }
+    }
+
+    var bulletinTab: some View {
         Form {
             Section {
                 Toggle("⭐ “For you” section", isOn: $model.config.for_you)
@@ -472,48 +734,73 @@ struct SettingsView: View {
                     Button("Open Summaries Folder") { NSWorkspace.shared.open(Paths.outDir) }
                 }
             } header: { Text("Personalization") } footer: {
-                Text("The profile decides what counts as “for you”. Changes apply to the next summary — use Regenerate to apply them to an earlier day.")
+                Text("Changes apply to the next summary — use Regenerate to apply them to an earlier day.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
-                Toggle("Automatic summaries (weekdays, checks 3–7 PM)", isOn: Binding(
-                    get: { model.status.job_enabled },
-                    set: { on in Task { await model.setSchedule(on) } }))
-                    .disabled(!model.status.job_found)
+                Toggle("Automatic summaries (weekdays, checks 3–7 PM)", isOn: scheduleBinding("bulletin"))
+                    .disabled(!model.status.job("bulletin").found)
                 Toggle("macOS notification", isOn: $model.config.notifications)
                 Toggle("Also post to Hermes Bot Chat", isOn: $model.config.post_to_chat)
-                if let next = model.status.next_run, model.status.job_enabled {
-                    LabeledContent("Next check", value: prettyDate(next))
+                if let next = model.status.job("bulletin").next_run, model.status.job("bulletin").enabled {
+                    LabeledContent("Next check", value: Fmt.iso(next))
                 }
             } header: { Text("Delivery") }
 
+            HStack {
+                Spacer()
+                Button("Restore Bulletin Defaults") {
+                    let keepTasks = (model.config.tasks_notifications, model.config.tasks_lookahead_days)
+                    model.config = Config()
+                    model.config.tasks_notifications = keepTasks.0
+                    model.config.tasks_lookahead_days = keepTasks.1
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minHeight: 620)
+    }
+
+    var assignmentsTab: some View {
+        Form {
+            Section {
+                Toggle("Automatic sync every 2 hours (7 AM – 11 PM)", isOn: scheduleBinding("tasks"))
+                    .disabled(!model.status.job("tasks").found)
+                Toggle("Turn Toddle announcements into tasks (AI)", isOn: scheduleBinding("announcements"))
+                    .disabled(!model.status.job("announcements").found)
+                Toggle("Notify me when new assignments are added", isOn: $model.config.tasks_notifications)
+                Stepper("Look ahead \(model.config.tasks_lookahead_days) days on the Toddle calendar",
+                        value: $model.config.tasks_lookahead_days, in: 7...90, step: 7)
+                if let next = model.status.job("tasks").next_run, model.status.job("tasks").enabled {
+                    LabeledContent("Next sync", value: Fmt.iso(next))
+                }
+            } header: { Text("Toddle → Google Tasks") } footer: {
+                Text("Assignments come from the Toddle calendar and Toddle reminder / due-date emails, and go into the “School” list in Google Tasks. Duplicates are skipped.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Button("Open Google Tasks") { NSWorkspace.shared.open(URL(string: "https://tasks.google.com/")!) }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minHeight: 340)
+    }
+
+    var accountTab: some View {
+        Form {
             Section {
                 LabeledContent("Google account") {
                     Text(model.status.signed_in ? (model.status.email ?? "Signed in") : "Not signed in")
                 }
                 Button(model.status.signed_in ? "Sign In Again…" : "Sign In…") { model.showSignIn = true }
-            } header: { Text("Account") }
-
-            HStack {
-                Spacer()
-                Button("Restore Defaults") { model.config = Config() }
+            } header: { Text("Google") } footer: {
+                Text("One sign-in covers both features: read-only Gmail and Calendar, plus Google Tasks.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520)
-        .frame(minHeight: 600)
-        .onChange(of: model.config) { _, _ in model.scheduleSave() }
-        .sheet(isPresented: $model.showSignIn) { SignInSheet().environmentObject(model) }
-    }
-
-    func prettyDate(_ iso: String) -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let d = f.date(from: iso) ?? { f.formatOptions = [.withInternetDateTime]; return f.date(from: iso) }()
-        guard let d else { return iso }
-        let o = DateFormatter(); o.dateFormat = "EEE MMM d, h:mm a"
-        return o.string(from: d)
+        .frame(minHeight: 220)
     }
 }
 
@@ -527,8 +814,8 @@ struct SignInSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Label("Sign in with your SAS Google account", systemImage: "person.badge.key").font(.title3.bold())
-            Text("The app only gets read-only access to Gmail so it can find the HS Daily Bulletin.")
-                .foregroundStyle(.secondary)
+            Text("SAS Sync reads Gmail and your Toddle calendar (read-only) and adds assignments to Google Tasks.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 6) {
                 Text("1. Open the Google sign-in page and allow access.")
                 Button(opened ? "Open Sign-in Page Again" : "Open Sign-in Page") {
@@ -563,16 +850,17 @@ struct SignInSheet: View {
 // MARK: - App
 
 @main
-struct SASBulletinApp: App {
+struct SASSyncApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("SAS Bulletin") {
+        WindowGroup("SAS Sync") {
             ContentView().environmentObject(model)
         }
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")
+                Button("Sync Assignments Now") { Task { await model.syncNow() } }.keyboardShortcut("s", modifiers: [.command, .shift])
             }
         }
         Settings {

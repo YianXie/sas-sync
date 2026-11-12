@@ -12,9 +12,12 @@ Usage:
 import base64, datetime, html, json, re, shutil, subprocess, sys, time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sas_google  # noqa: E402  shared sign-in
+
 HOME = Path.home() / ".hermes"
 CLIENT = HOME / "google_client_secret.json"
-TOKEN = HOME / "sas_gmail_token.json"
+TOKEN = sas_google.TOKEN
 PENDING = HOME / "sas_gmail_pending.json"
 STATE = HOME / "sas_bulletin_state.json"
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -23,42 +26,15 @@ QUERY = 'subject:"HS Daily Bulletin" newer_than:7d'
 
 
 def service():
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
-    creds = Credentials.from_authorized_user_file(str(TOKEN), SCOPES)
-    if not creds.valid:
-        creds.refresh(Request())
-        TOKEN.write_text(creds.to_json())
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return sas_google.service("gmail", "v1")
 
 
 def auth_url():
-    from google_auth_oauthlib.flow import Flow
-    flow = Flow.from_client_secrets_file(str(CLIENT), scopes=SCOPES, redirect_uri=REDIRECT,
-                                         autogenerate_code_verifier=True)
-    url, state = flow.authorization_url(access_type="offline", prompt="consent")
-    PENDING.write_text(json.dumps({"state": state, "verifier": flow.code_verifier}))
-    print(url)
+    sas_google.auth_url()
 
 
 def auth_code(raw):
-    from urllib.parse import urlparse, parse_qs
-    from google_auth_oauthlib.flow import Flow
-    p = json.loads(PENDING.read_text())
-    code = raw
-    if raw.startswith("http"):
-        q = parse_qs(urlparse(raw).query)
-        code = q["code"][0]
-        if q.get("state", [p["state"]])[0] != p["state"]:
-            sys.exit("ERROR: state mismatch - run auth-url again")
-    flow = Flow.from_client_secrets_file(str(CLIENT), scopes=SCOPES, redirect_uri=REDIRECT,
-                                         state=p["state"], code_verifier=p["verifier"])
-    flow.fetch_token(code=code)
-    TOKEN.write_text(flow.credentials.to_json())
-    TOKEN.chmod(0o600)
-    PENDING.unlink(missing_ok=True)
-    print("OK: token saved")
+    sas_google.auth_code(raw)
 
 
 def latest(svc):
@@ -129,8 +105,7 @@ NET_ERRORS = ("TransportError", "ConnectionError", "NameResolution", "Timeout", 
 
 
 def _is_network_error(e):
-    s = f"{type(e).__name__} {e}"
-    return any(x in s for x in NET_ERRORS)
+    return sas_google.is_network_error(e)
 
 
 def fetch(force=False, mid=None):
@@ -197,6 +172,7 @@ CONFIG = OUTDIR / "config.json"
 REGEN = OUTDIR / "regen_request.json"
 LAST_PUB = OUTDIR / "last_publish.json"
 JOB_ID = "5234ce72f5b5"
+JOBS = {"bulletin": "5234ce72f5b5", "tasks": "2a7f14318718", "announcements": "96cc9fd686dc"}
 DEFAULTS = {
     "for_you": True,                       # show the "For you" section
     "for_you_max": 6,                      # max items in "For you"
@@ -208,9 +184,12 @@ DEFAULTS = {
     "notifications": True,                 # macOS pop-up
     "post_to_chat": True,                  # also post the summary to Hermes Bot Chat
     "extra_instructions": "",
+    # Toddle assignments (read by sas_tasks.py)
+    "tasks_notifications": True,           # pop-up when new assignments are added
+    "tasks_lookahead_days": 28,            # how far ahead to read the Toddle calendar
 }
-_APPS = Path.home() / "Applications/SAS Bulletin.app/Contents"
-_TN_CANDIDATES = [_APPS / "Helpers/SAS Bulletin Notifier.app/Contents/MacOS/terminal-notifier",
+_APPS = Path.home() / "Applications/SAS Sync.app/Contents"
+_TN_CANDIDATES = [_APPS / "Helpers/SAS Sync Notifier.app/Contents/MacOS/terminal-notifier",
                   _APPS / "MacOS/terminal-notifier", Path("/opt/homebrew/bin/terminal-notifier")]
 TN = str(next((p for p in _TN_CANDIDATES if p.exists()), _TN_CANDIDATES[-1]))
 
@@ -236,11 +215,18 @@ def find_hermes():
     raise SystemExit("hermes CLI not found")
 
 
-def _job():
+def _job(jid=JOB_ID):
     for j in _load_json(HOME / "cron/jobs.json", {}).get("jobs", []):
-        if j.get("job_id") == JOB_ID or j.get("id") == JOB_ID:
+        if j.get("job_id") == jid or j.get("id") == jid:
             return j
     return None
+
+
+def _job_info(jid):
+    j = _job(jid)
+    return {"found": bool(j), "enabled": bool(j and j.get("enabled") and j.get("state") != "paused"),
+            "next_run": j and j.get("next_run_at"), "last_run": j and j.get("last_run_at"),
+            "last_status": j and j.get("last_status")}
 
 
 def cmd_status():
@@ -261,6 +247,7 @@ def cmd_status():
     out["regen_pending"] = bool(req.get("id")) and not req.get("done")
     out["regen_id"] = req.get("id")
     out["last_publish"] = _load_json(LAST_PUB, None)
+    out["jobs"] = {k: _job_info(v) for k, v in JOBS.items()}
     print(json.dumps(out))
 
 
@@ -317,8 +304,8 @@ def cmd_regen(mid):
     print(json.dumps({"ok": r.returncode == 0, "output": (r.stdout + r.stderr)[-400:]}))
 
 
-def cmd_schedule(on):
-    r = subprocess.run([find_hermes(), "cron", "resume" if on else "pause", JOB_ID], capture_output=True, text=True)
+def cmd_schedule(on, which="bulletin"):
+    r = subprocess.run([find_hermes(), "cron", "resume" if on else "pause", JOBS[which]], capture_output=True, text=True)
     print(json.dumps({"ok": r.returncode == 0, "output": (r.stdout + r.stderr)[-400:]}))
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
@@ -413,5 +400,5 @@ if __name__ == "__main__":
     elif cmd == "status": cmd_status()
     elif cmd == "list": cmd_list()
     elif cmd == "regen": cmd_regen(a[1])
-    elif cmd == "schedule": cmd_schedule(a[1] == "on")
+    elif cmd == "schedule": cmd_schedule(a[1] == "on", a[2] if len(a) > 2 else "bulletin")
     elif cmd == "config": print(json.dumps(load_config()))
