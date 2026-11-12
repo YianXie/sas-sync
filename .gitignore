@@ -1,0 +1,25 @@
+# Build output
+build/
+*.app/
+*.iconset/
+.build/
+DerivedData/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets & personal data (never commit)
+*client_secret*.json
+*token*.json
+profile.md
+config.json
+summary.md
+sas_bulletins/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
