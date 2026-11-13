@@ -172,7 +172,8 @@ CONFIG = OUTDIR / "config.json"
 REGEN = OUTDIR / "regen_request.json"
 LAST_PUB = OUTDIR / "last_publish.json"
 JOB_ID = "5234ce72f5b5"
-JOBS = {"bulletin": "5234ce72f5b5", "tasks": "2a7f14318718", "announcements": "96cc9fd686dc"}
+JOBS = {"bulletin": "5234ce72f5b5", "tasks": "2a7f14318718", "announcements": "96cc9fd686dc",
+        "enews": "68646aab2409"}
 DEFAULTS = {
     "for_you": True,                       # show the "For you" section
     "for_you_max": 6,                      # max items in "For you"
@@ -187,6 +188,11 @@ DEFAULTS = {
     # Toddle assignments (read by sas_tasks.py)
     "tasks_notifications": True,           # pop-up when new assignments are added
     "tasks_lookahead_days": 28,            # how far ahead to read the Toddle calendar
+    # Weekly eNews (read by sas_enews.py)
+    "enews_notifications": True,           # pop-up when the weekly eNews summary is ready
+    "enews_post_to_chat": False,           # also post the eNews summary to Hermes Bot Chat
+    "enews_include_other_divisions": False,  # include Elementary / Middle School / Alumni sections
+    "enews_extra_instructions": "",
 }
 _APPS = Path.home() / "Applications/SAS Sync.app/Contents"
 _TN_CANDIDATES = [_APPS / "Helpers/SAS Sync Notifier.app/Contents/MacOS/terminal-notifier",
@@ -322,8 +328,10 @@ details p strong{{font-size:1em;margin-top:1em}}
 </style></head><body><div class="nav">{nav}</div>{body}</body></html>"""
 
 
-def publish(md_path, title, msg):
-    """Render summary markdown to HTML, then show a clickable notification that opens it."""
+def publish(md_path, title, msg, outdir=None, last_pub=None, group="sas-bulletin", write_latest=True):
+    """Render summary markdown to HTML, then show a clickable notification that opens it.
+    msg=None skips the notification (caller already applied its own setting)."""
+    outdir, last_pub = outdir or OUTDIR, last_pub or LAST_PUB
     import markdown
     md = Path(md_path).read_text()
     md = re.sub(r"(?m)^(\s*)- \[ \] ", r"\1- ☐ ", md)
@@ -334,7 +342,7 @@ def publish(md_path, title, msg):
     conv = lambda s: markdown.markdown(s, extensions=["extra", "sane_lists"])
     top, _, rest = md.partition("<!--more-->")
     tail_link = ""
-    m_link = re.search(r"\n(\[Open full bulletin in Gmail\]\([^)]*\))\s*$", rest)
+    m_link = re.search(r"\n(\[Open (?:the )?full [^\]\n]*\]\([^)]*\))\s*$", rest)
     if m_link:
         tail_link, rest = m_link.group(1), rest[:m_link.start()]
     body = conv(top)
@@ -345,27 +353,29 @@ def publish(md_path, title, msg):
     if tail_link:
         body += conv(tail_link)
     body = body.replace("<a href=", '<a target="_blank" href=')
-    OUTDIR.mkdir(exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
     dm = re.search(r"([A-Z][a-z]{2})[a-z]* (\d{1,2}),? (\d{4})", title)
     try:
         stamp = datetime.datetime.strptime(" ".join(dm.groups()), "%b %d %Y").date().isoformat()
     except Exception:
         stamp = datetime.date.today().isoformat()
-    page = OUTDIR / f"{stamp}.html"
-    older = sorted(p.name for p in OUTDIR.glob("20*.html") if p.name != page.name)[-5:]
+    page = outdir / f"{stamp}.html"
+    older = sorted(p.name for p in outdir.glob("20*.html")
+                   if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.html", p.name) and p.name != page.name)[-5:]
     nav = "Previous: " + " · ".join(f'<a href="{n}">{n[:-5]}</a>' for n in reversed(older)) if older else ""
     html_doc = PAGE.format(title=html.escape(title), nav=nav, body=body)
     page.write_text(html_doc)
-    (OUTDIR / "latest.html").write_text(html_doc)
-    LAST_PUB.write_text(json.dumps({"stamp": stamp, "title": title, "time": time.time()}))
-    if load_config()["notifications"]:
-        notify(title, msg, page.as_uri())
+    if write_latest:
+        (outdir / "latest.html").write_text(html_doc)
+    last_pub.write_text(json.dumps({"stamp": stamp, "title": title, "time": time.time()}))
+    if msg is not None:
+        notify(title, msg, page.as_uri(), group)
     print(f"OK: {page}")
 
 
-def notify(title, msg, open_url=None):
+def notify(title, msg, open_url=None, group="sas-bulletin"):
     if Path(TN).exists():
-        cmd = [TN, "-title", title, "-message", msg, "-sound", "Glass", "-group", "sas-bulletin"]
+        cmd = [TN, "-title", title, "-message", msg, "-sound", "Glass", "-group", group]
         if open_url:
             cmd += ["-open", open_url]
         subprocess.run(cmd)
@@ -396,7 +406,8 @@ if __name__ == "__main__":
         mid = next((x.split("=", 1)[1] for x in a if x.startswith("--id=")), None)
         fetch("--force" in a, mid)
     elif cmd == "notify": notify(a[1], a[2])
-    elif cmd == "publish": publish(a[1], a[2], a[3])  # publish SUMMARY.md TITLE MESSAGE
+    elif cmd == "publish":  # publish SUMMARY.md TITLE MESSAGE
+        publish(a[1], a[2], a[3] if load_config()["notifications"] else None)
     elif cmd == "status": cmd_status()
     elif cmd == "list": cmd_list()
     elif cmd == "regen": cmd_regen(a[1])

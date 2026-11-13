@@ -1,8 +1,9 @@
 # SAS Sync
 
-A small native macOS app for Singapore American School students that brings two things into one window:
+A small native macOS app for Singapore American School students that brings three things into one window:
 
 - **HS Daily Bulletin → short, personalized summaries.** You get a "⭐ For you" section, new items at the top, and everything else folded away.
+- **Weekly SAS eNews → the same kind of summary.** The [eNews](https://www.sas.edu.sg/enews) is written for parents of every division; SAS Sync pulls out what matters to a high schooler.
 - **Toddle assignments → Google Tasks.** It syncs Toddle calendar tasks and reminder/due-date emails into a "School" task list.
 
 <img src="Resources/icon_preview.png" width="96" alt="SAS Sync icon">
@@ -11,6 +12,7 @@ A small native macOS app for Singapore American School students that brings two 
 
 - **Assignments:** open tasks are grouped as Overdue, Today, Tomorrow, Next 7 days and Later. Use **Sync Now** to pull from Toddle, and check off a task to complete it in Google Tasks.
 - **Bulletins:** browse the last 60 days, read each summary in the app, and **Regenerate** any day with your current settings.
+- **eNews:** the page at sas.edu.sg/enews is checked on Thursday/Friday afternoons (it's published the last school day of the week, usually Friday ~3:15 PM). Each issue is archived locally, so you can read the summary or the **Full eNews** for past weeks even after the page moves on. Posts that repeat from last week are tagged so the summary can focus on what's new.
 - **Settings:** turn summary sections on or off, set item limits and the urgent-deadline window, add extra instructions, and edit an interests profile. You can also set the assignment look-ahead, choose notifications, and pause or resume each automatic job.
 - **Notifications:** clickable macOS pop-ups with a custom icon.
 - **Sign-in:** one Google sign-in covers everything. Gmail and Calendar access is read-only, and Tasks access is read/write.
@@ -25,11 +27,12 @@ Gmail + Toddle calendar ──► backend/*.py ──► Hermes cron jobs ──
 
 | File | Purpose |
 |---|---|
-| `Sources/main.swift` | SwiftUI app; it calls `~/.hermes/scripts/sas_bulletin_cli.sh` and `sas_tasks_cli.sh` |
+| `Sources/main.swift` | SwiftUI app; it calls `~/.hermes/scripts/sas_bulletin_cli.sh`, `sas_enews_cli.sh` and `sas_tasks_cli.sh` |
 | `backend/sas_google.py` | Shared Google OAuth (one token) |
 | `backend/sas_bulletin.py` | Fetches bulletins, tags sections NEW/REPEAT, renders HTML, handles regenerate requests |
+| `backend/sas_enews.py` | Fetches and archives the weekly eNews page, splits it by section, tags posts NEW/REPEAT, handles regenerate requests |
 | `backend/sas_tasks.py` | Syncs Toddle to the Google Tasks "School" list without duplicates, and handles completing tasks |
-| `backend/cron-prompts.md` | The three [Hermes](https://hermes-agent.nousresearch.com) scheduled jobs |
+| `backend/cron-prompts.md` | The four [Hermes](https://hermes-agent.nousresearch.com) scheduled jobs |
 
 ## Requirements
 

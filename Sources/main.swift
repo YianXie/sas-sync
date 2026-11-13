@@ -1,7 +1,8 @@
 // SAS Sync — a small native macOS app for Ian's Singapore American School workflow:
 //   • HS Daily Bulletin → short personalized summaries
+//   • Weekly SAS eNews (sas.edu.sg/enews) → short personalized summaries
 //   • Toddle assignments → Google Tasks "School" list
-// The heavy lifting lives in ~/.hermes/scripts (sas_bulletin.py, sas_tasks.py, sas_google.py)
+// The heavy lifting lives in ~/.hermes/scripts (sas_bulletin.py, sas_enews.py, sas_tasks.py, sas_google.py)
 // and Hermes cron jobs; this app is the control panel.
 
 import AppKit
@@ -15,7 +16,10 @@ enum Paths {
     static let hermes = home.appendingPathComponent(".hermes")
     static let bulletinCLI = hermes.appendingPathComponent("scripts/sas_bulletin_cli.sh").path
     static let tasksCLI = hermes.appendingPathComponent("scripts/sas_tasks_cli.sh").path
+    static let enewsCLI = hermes.appendingPathComponent("scripts/sas_enews_cli.sh").path
     static let outDir = hermes.appendingPathComponent("sas_bulletins")
+    static let enewsDir = outDir.appendingPathComponent("enews")
+    static let enewsURL = URL(string: "https://www.sas.edu.sg/enews")!
     static let config = outDir.appendingPathComponent("config.json")
     static let profile = outDir.appendingPathComponent("profile.md")
 }
@@ -55,6 +59,32 @@ struct SchoolTask: Codable, Identifiable, Hashable {
 }
 
 struct LastPublish: Codable, Equatable { let stamp: String?; let title: String?; let time: Double? }
+
+struct ENewsIssue: Codable, Identifiable, Hashable {
+    let id: String          // issue date, YYYY-MM-DD
+    let stamp: String
+    let title: String
+    let summarized: Bool
+    let has_page: Bool
+    let page: String        // rendered summary
+    let raw: String         // archived copy of the eNews page
+    let live: Bool          // currently at sas.edu.sg/enews
+
+    var tag: String { "enews:" + id }
+    var shortTitle: String {
+        guard let d = Fmt.ymd.date(from: stamp) else { return title }
+        let f = DateFormatter(); f.dateFormat = "EEE, MMM d"
+        return f.string(from: d)
+    }
+}
+
+struct ENewsList: Codable { let issues: [ENewsIssue]; let error: String?; let url: String? }
+
+struct ENewsStatus: Codable {
+    var regen_pending: Bool = false
+    var regen_id: String?
+    var last_publish: LastPublish?
+}
 
 struct JobInfo: Codable {
     var found: Bool = false
@@ -105,6 +135,10 @@ struct Config: Codable, Equatable {
     var extra_instructions = ""
     var tasks_notifications = true
     var tasks_lookahead_days = 28
+    var enews_notifications = true
+    var enews_post_to_chat = false
+    var enews_include_other_divisions = false
+    var enews_extra_instructions = ""
 
     init() {}
     // Tolerant decoding: missing keys fall back to defaults.
@@ -124,6 +158,10 @@ struct Config: Codable, Equatable {
         extra_instructions = v(.extra_instructions, d.extra_instructions)
         tasks_notifications = v(.tasks_notifications, d.tasks_notifications)
         tasks_lookahead_days = v(.tasks_lookahead_days, d.tasks_lookahead_days)
+        enews_notifications = v(.enews_notifications, d.enews_notifications)
+        enews_post_to_chat = v(.enews_post_to_chat, d.enews_post_to_chat)
+        enews_include_other_divisions = v(.enews_include_other_divisions, d.enews_include_other_divisions)
+        enews_extra_instructions = v(.enews_extra_instructions, d.enews_extra_instructions)
     }
 }
 
@@ -199,6 +237,10 @@ final class AppModel: ObservableObject {
     static let assignmentsTag = "__assignments__"
 
     @Published var bulletins: [Bulletin] = []
+    @Published var enews: [ENewsIssue] = []
+    @Published var enewsError: String?
+    @Published var enewsStatus = ENewsStatus()
+    @Published var regeneratingENews: String?     // issue stamp
     @Published var tasks: [SchoolTask] = []
     @Published var status = StatusInfo()
     @Published var tasksStatus = TasksStatus()
@@ -220,14 +262,20 @@ final class AppModel: ObservableObject {
     }
 
     var selectedBulletin: Bulletin? { bulletins.first { $0.id == selection } }
+    var selectedENews: ENewsIssue? { enews.first { $0.tag == selection } }
 
     func refresh() async {
         loading = true
         async let s = Backend.json(StatusInfo.self, Paths.bulletinCLI, ["status"])
         async let ts = Backend.json(TasksStatus.self, Paths.tasksCLI, ["json-status"])
+        async let en = Backend.json(ENewsList.self, Paths.enewsCLI, ["list"])   // public page, no sign-in needed
+        async let es = Backend.json(ENewsStatus.self, Paths.enewsCLI, ["status"])
         let (st, stErr) = await s
         if let st { status = st } else { banner = "Status error: \(stErr)" }
         if let t = (await ts).0 { tasksStatus = t }
+        let (el, elErr) = await en
+        if let el { enews = el.issues; enewsError = el.error } else { enewsError = elErr }
+        if let e = (await es).0 { enewsStatus = e }
         if status.signed_in {
             async let l = Backend.json([Bulletin].self, Paths.bulletinCLI, ["list"])
             async let t = Backend.json([SchoolTask].self, Paths.tasksCLI, ["json-list"])
@@ -292,6 +340,33 @@ final class AppModel: ObservableObject {
         }
         regenerating = nil
         banner = "Regeneration is taking longer than expected — it will appear when Hermes finishes."
+    }
+
+    // MARK: eNews
+    func regenerate(_ issue: ENewsIssue) async {
+        guard regeneratingENews == nil else { return }
+        regeneratingENews = issue.id
+        banner = nil
+        let started = Date().timeIntervalSince1970
+        let (res, err) = await Backend.json(OKResult.self, Paths.enewsCLI, ["regen", issue.id])
+        guard let res, res.ok else {
+            banner = "Couldn't start eNews summary: \(res?.output ?? err)"; regeneratingENews = nil; return
+        }
+        for _ in 0..<96 {   // poll up to ~8 min
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if let st = (await Backend.json(ENewsStatus.self, Paths.enewsCLI, ["status"])).0 {
+                enewsStatus = st
+                if !st.regen_pending, let t = st.last_publish?.time, t > started {
+                    regeneratingENews = nil
+                    await refresh()
+                    selection = issue.tag
+                    banner = "Summarized \(issue.title)."
+                    return
+                }
+            }
+        }
+        regeneratingENews = nil
+        banner = "The eNews summary is taking longer than expected — it will appear when Hermes finishes."
     }
 
     // MARK: Assignments
@@ -359,6 +434,9 @@ final class AppModel: ObservableObject {
 struct SummaryWebView: NSViewRepresentable {
     let fileURL: URL
     let version: Int
+    /// When set, the file is loaded as an HTML string with this base URL (archived web pages, so relative
+    /// images/CSS resolve against the real site).
+    var baseURL: URL? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -371,17 +449,29 @@ struct SummaryWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ wv: WKWebView, context: Context) {
-        let key = "\(fileURL.path)#\(version)"
+        let key = "\(fileURL.path)#\(version)#\(baseURL?.absoluteString ?? "")"
         guard context.coordinator.loadedKey != key else { return }
         context.coordinator.loadedKey = key
-        wv.loadFileURL(fileURL, allowingReadAccessTo: fileURL.deletingLastPathComponent())
+        if let baseURL {
+            let html = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "<p>Archived page is missing.</p>"
+            wv.loadHTMLString(html, baseURL: baseURL)
+        } else {
+            wv.loadFileURL(fileURL, allowingReadAccessTo: fileURL.deletingLastPathComponent())
+        }
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var loadedKey = ""
+        static func sameDocument(_ a: URL?, _ b: URL?) -> Bool {
+            guard let a, let b, var ca = URLComponents(url: a, resolvingAgainstBaseURL: false),
+                  var cb = URLComponents(url: b, resolvingAgainstBaseURL: false) else { return false }
+            ca.fragment = nil; cb.fragment = nil
+            return ca.url == cb.url
+        }
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            if action.navigationType == .linkActivated, let url = action.request.url, url.scheme != "file" {
+            if action.navigationType == .linkActivated, let url = action.request.url, url.scheme != "file",
+               !(url.fragment != nil && Self.sameDocument(url, webView.url)) {   // in-page anchors stay here
                 NSWorkspace.shared.open(url); decisionHandler(.cancel); return
             }
             decisionHandler(.allow)
@@ -408,6 +498,8 @@ struct ContentView: View {
         } detail: {
             if model.selection == AppModel.assignmentsTag {
                 AssignmentsView()
+            } else if model.selection?.hasPrefix("enews:") == true {
+                ENewsDetail()
             } else {
                 BulletinDetail()
             }
@@ -465,6 +557,37 @@ struct Sidebar: View {
 
     var body: some View {
         List(selection: $model.selection) {
+            Section("SAS eNews · Weekly") {
+                if model.enews.isEmpty {
+                    Label(model.enewsError == nil ? "Loading…" : "Couldn't load eNews", systemImage: "envelope.open")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(model.enews) { e in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 5) {
+                                Text(e.shortTitle).font(.headline)
+                                if e.live {
+                                    Text("LATEST").font(.system(size: 9, weight: .bold))
+                                        .padding(.horizontal, 4).padding(.vertical, 1)
+                                        .background(Capsule().fill(.blue.opacity(0.2))).foregroundStyle(.blue)
+                                }
+                            }
+                            Text(e.has_page ? "Summary ready" : "Not summarized")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if model.regeneratingENews == e.id { ProgressView().controlSize(.small) }
+                        else if e.has_page { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    }
+                    .tag(e.tag)
+                    .contextMenu {
+                        Button(e.has_page ? "Regenerate Summary" : "Generate Summary") { Task { await model.regenerate(e) } }
+                            .disabled(model.regeneratingENews != nil)
+                        Button("Open on sas.edu.sg") { NSWorkspace.shared.open(Paths.enewsURL) }
+                    }
+                }
+            }
             Section("Toddle") {
                 HStack {
                     Label("Assignments", systemImage: "checklist")
@@ -683,6 +806,62 @@ struct BulletinDetail: View {
     }
 }
 
+// MARK: eNews detail
+
+struct ENewsDetail: View {
+    @EnvironmentObject var model: AppModel
+    @State private var showOriginal = false
+
+    var caption: String {
+        if let e = model.selectedENews, model.regeneratingENews == e.id { return "Summarizing… this usually takes 1–2 minutes" }
+        if let err = model.enewsError { return err == "offline" ? "Offline — showing the saved copy" : "Couldn't check for updates: \(err)" }
+        return "New issue every Friday after school (~3:15 PM) · \(Paths.enewsURL.host ?? "")/enews"
+    }
+
+    var body: some View {
+        if let e = model.selectedENews {
+            VStack(spacing: 0) {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text(e.title).font(.title3.bold())
+                        Text(caption).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    Picker("", selection: $showOriginal) {
+                        Text("Summary").tag(false)
+                        Text("Full eNews").tag(true)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().fixedSize()
+                    Button { Task { await model.regenerate(e) } } label: {
+                        Label(e.has_page ? "Regenerate" : "Generate Summary", systemImage: "sparkles")
+                    }
+                    .disabled(model.regeneratingENews != nil)
+                    .help("Summarize this issue with your current settings")
+                    Button {
+                        NSWorkspace.shared.open(e.live || !e.has_page ? Paths.enewsURL : URL(fileURLWithPath: e.page))
+                    } label: { Image(systemName: "safari") }
+                    .help(e.live ? "Open sas.edu.sg/enews in browser" : "Open summary in browser")
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                Divider()
+                if showOriginal {
+                    SummaryWebView(fileURL: URL(fileURLWithPath: e.raw), version: model.pageVersion, baseURL: Paths.enewsURL)
+                } else if e.has_page {
+                    SummaryWebView(fileURL: URL(fileURLWithPath: e.page), version: model.pageVersion)
+                } else {
+                    ContentUnavailableView {
+                        Label("No summary yet", systemImage: "envelope.open")
+                    } description: {
+                        Text("This eNews issue hasn't been summarized. Click Generate Summary, or switch to Full eNews.")
+                    }
+                }
+            }
+        } else {
+            ContentUnavailableView("Select an eNews issue", systemImage: "envelope.open")
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct SettingsView: View {
@@ -696,6 +875,7 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             bulletinTab.tabItem { Label("Bulletin", systemImage: "newspaper") }
+            enewsTab.tabItem { Label("eNews", systemImage: "envelope.open") }
             assignmentsTab.tabItem { Label("Assignments", systemImage: "checklist") }
             accountTab.tabItem { Label("Account", systemImage: "person.crop.circle") }
         }
@@ -751,15 +931,53 @@ struct SettingsView: View {
             HStack {
                 Spacer()
                 Button("Restore Bulletin Defaults") {
-                    let keepTasks = (model.config.tasks_notifications, model.config.tasks_lookahead_days)
-                    model.config = Config()
-                    model.config.tasks_notifications = keepTasks.0
-                    model.config.tasks_lookahead_days = keepTasks.1
+                    var d = Config()   // only reset bulletin keys; keep assignment + eNews settings
+                    d.tasks_notifications = model.config.tasks_notifications
+                    d.tasks_lookahead_days = model.config.tasks_lookahead_days
+                    d.enews_notifications = model.config.enews_notifications
+                    d.enews_post_to_chat = model.config.enews_post_to_chat
+                    d.enews_include_other_divisions = model.config.enews_include_other_divisions
+                    d.enews_extra_instructions = model.config.enews_extra_instructions
+                    model.config = d
                 }
             }
         }
         .formStyle(.grouped)
         .frame(minHeight: 620)
+    }
+
+    var enewsTab: some View {
+        Form {
+            Section {
+                Toggle("Include Elementary, Middle School and Alumni sections", isOn: $model.config.enews_include_other_divisions)
+                TextField("Extra instructions", text: $model.config.enews_extra_instructions,
+                          prompt: Text("e.g. Always list Booster spirit days"), axis: .vertical)
+                    .lineLimit(2...5)
+            } header: { Text("Summary") } footer: {
+                Text("The eNews is written for parents of every division; the summary keeps what matters to a high schooler, ranked with your interests profile. “For you” uses the same item limit as the bulletin.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Automatic summary (Thu & Fri, checks 3–8 PM)", isOn: scheduleBinding("enews"))
+                    .disabled(!model.status.job("enews").found)
+                Toggle("macOS notification", isOn: $model.config.enews_notifications)
+                Toggle("Also post to Hermes Bot Chat", isOn: $model.config.enews_post_to_chat)
+                if let next = model.status.job("enews").next_run, model.status.job("enews").enabled {
+                    LabeledContent("Next check", value: Fmt.iso(next))
+                }
+            } header: { Text("Delivery") } footer: {
+                Text("eNews comes out the last school day of each week, usually Friday ~3:15 PM. The page at sas.edu.sg/enews is checked every 10 minutes and summarized once when a new issue appears.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                HStack {
+                    Button("Open sas.edu.sg/enews") { NSWorkspace.shared.open(Paths.enewsURL) }
+                    Button("Open eNews Folder") { NSWorkspace.shared.open(Paths.enewsDir) }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minHeight: 460)
     }
 
     var assignmentsTab: some View {
